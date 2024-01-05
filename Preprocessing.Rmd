@@ -1,0 +1,850 @@
+---
+title: "PercAct"
+author: "Sofie Bøjgaard Thomsen"
+date: "2023-12-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+install.packages("pwr")
+install.packages("tidyverse")
+install.packages("purrr")
+install.packages("rstatix")
+install.packages("ez")
+install.packages("lme4", dependencies=TRUE)
+install.packages("Matrix", dependencies=TRUE)
+install.packages("effects")
+install.packages("sjPlot")
+install.packages("sjmisc")
+install.packages("report")
+library(ez)
+library(tidyverse)
+library(pwr)
+library(purrr)
+library(rstatix)
+library(ggplot2)
+library(lme4)
+library(effects)
+library(sjPlot)
+library(sjmisc)
+library(car)
+library(report)
+
+```
+
+#Power Analysis
+To ensure the correct number of participants, a power analysis should be conducted in order to be sure whether the analysis results can reveal anything about the real world. 
+
+Leaning against the effect size from Stothart et al. 2015 (The attentional cost of receiving a cell phone notification) 
+
+```{r}
+# Assuming you have the b values and standard errors for your logistic regression conditions
+b_call <- -0.17
+se_call <- 0.05
+
+b_text <- 0.11
+se_text <- 0.05
+
+# Calculate the odds ratios and their standard errors
+or_call <- exp(b_call)
+se_or_call <- exp(se_call)
+
+or_text <- exp(b_text)
+se_or_text <- exp(se_text)
+
+# Calculate the effect size (log odds ratio)
+effect_size <- b_text - b_call
+effect_size
+
+# Perform power analysis for logistic regression
+library(pwr)
+
+result <- pwr.2p.test(h = effect_size,
+                      n = NULL,  # sample size (NULL if you want to calculate it)
+                      sig.level = 0.05,  # alpha/sig. level = 0.05
+                      power = 0.8,
+                      alternative = "two.sided")
+
+result
+```
+-> 201 participants are needed in each condition...
+
+First, I'll read and merge the files 
+
+Starting with the PsychoPy-file
+```{r}
+# Replace "your_directory_path" with the actual directory path containing your modified text files
+directory_path <- "/Users/sofiebojgaardthomsen/Documents/3rd_semester/Perc_act/EXAM/SART/Data"
+
+# List all text files in the specified directory
+file_list <- list.files(path = directory_path, pattern = "\\.txt$", full.names = TRUE)
+
+# Read each text file into a separate data frame
+data_list <- lapply(file_list, function(file) read.table(file, sep = "\t", header = TRUE))
+
+# Combine the data frames into one long dataframe
+combined_df <- do.call(rbind, data_list)
+
+# Display the structure of the combined dataframe
+str(combined_df)
+
+```
+Preprocessing of PsychoPy
+```{r}
+# Removing all trials (when block_num is 0)
+combined_df <- combined_df[combined_df$block_num != 0, ]
+
+# Making part_id lowercased
+combined_df$part_id <- tolower(combined_df$part_id)
+
+# Replacing "," with "." in screentime
+combined_df$screentime <- gsub(",", ".", combined_df$screentime)
+
+# Convert the 'screentime' column to numeric
+combined_df$screentime <- as.numeric(combined_df$screentime)
+
+# Calculate decimal hours for screentime
+combined_df$decimal_hours <- floor(combined_df$screentime) + 
+                             ((combined_df$screentime - floor(combined_df$screentime)) * 100) / 60
+
+#Removing the first 2 trials to match it with recordings from ETG
+combined_df <- combined_df[combined_df$trial_num > 2, ]
+
+# Changing conditions the 2 times I misplaced participants accoridng to what condition they received
+combined_df$condition[combined_df$part_id %in% c("fd2456", "ma5392")] <- 2
+
+# Changing the one gender that was put in incorrectly - changed from "please select" to "male"
+combined_df <- combined_df %>%
+  mutate(part_gender = ifelse(part_id == "th2506", "Male", part_gender))
+
+# calculating the difference between trial start and end (first instance)
+combined_df <- combined_df %>%
+  group_by(part_id) %>%
+  mutate(
+    time_difference = ifelse(trial_num == 3, trial_end_time_s - trial_start_time_s, NA)
+  ) %>%
+  ungroup()
+
+# Create a new column 'elapsed_time_start' that represents time since recording started
+combined_df <- combined_df %>%
+  group_by(part_id) %>%
+  arrange(part_id, trial_start_time_s) %>%
+  mutate(
+    elapsed_time_start = trial_start_time_s - first(trial_start_time_s[trial_num == 3])
+  ) %>%
+  ungroup()
+
+# Create a new column 'elapsed_time_end' that represents time the trial ended according to when the recording started
+combined_df <- combined_df %>%
+  group_by(part_id) %>%
+  arrange(part_id, trial_end_time_s) %>%
+  mutate(
+    elapsed_time_end = trial_end_time_s - first(trial_end_time_s[trial_num == 3]) + first(time_difference[trial_num == 3])
+  ) %>%
+  ungroup()
+```
+
+Moving onto the ETG-data
+
+```{r}
+getwd()
+ETG_phone <- read_csv("Exam_Project_MARKER-MAPPER_Phone_csv/fixations.csv")
+ETG_pc <- read_csv("Exam_Project_MARKER-MAPPER_PC_csv/fixations.csv")
+ETG_name<- read_csv("raw-data-export/sections.csv")
+
+# Assuming 'fixation_detected_on_surface' is the name of the column
+pc_fixations <- table(ETG_pc$'fixation detected on surface')
+phone_fixations <- table(ETG_phone$'fixation detected on surface')
+# Display the counts
+print(pc_fixations)
+print(phone_fixations)
+
+# Merging with the name from ETG_name
+# Merge based on the 'recording id' column
+pc_name <- merge(ETG_pc, ETG_name[, c("recording id", "wearer name")], by = "recording id", all.x = TRUE)
+phone_name <- merge(ETG_phone, ETG_name[, c("recording id", "wearer name")], by = "recording id", all.x = TRUE)
+
+```
+
+Exploring the data
+```{r}
+# Assuming 'part_id' and 'condition' are the names of the columns
+participant_summary <- aggregate(condition ~ part_id, data = combined_df, FUN = function(x) unique(x))
+
+# Assuming 'part_id' and 'condition' are the names of the columns
+condition_counts <- table(combined_df$condition)
+
+# Display the counts /88, to make it show how many participants instead of observations
+condition_counts/88
+```
+
+Loading the participant specific data
+
+```{r specify_paths}
+main_folder <- "/Users/sofiebojgaardthomsen/Documents/3rd_semester/Perc_act/EXAM/Data analysis/raw-data-export"
+subfolders <- list.dirs("/Users/sofiebojgaardthomsen/Documents/3rd_semester/Perc_act/EXAM/Data analysis/raw-data-export", full.names = T, recursive = T)
+```
+
+Events
+
+```{r read_events}
+
+# create list of "events.csv" paths
+events <- lapply(subfolders, function(subfolder) {
+  # file path within each subfolder
+  events_path <- file.path(subfolder, "events.csv")
+
+  # Check if the file exists
+  if (file.exists(events_path)) {
+    # if the file exists, return the file path
+    return(events_path)
+  } else {
+    # if the file does not exist, return NULL
+    return(NULL)
+  }
+})
+
+# Remove NULL Values from the list 
+events <- Filter(Negate(is.null), events)
+
+# Read and Combine CSV files
+events <- bind_rows(lapply(events, read.csv))
+
+```
+
+```{r task_time}
+events1 <- subset(events, type == "cloud")
+events1 <- rename(events1, "event" = "name")
+events1 <- rename(events1, "name" = 'recording.id')
+```
+
+```{r}
+# Making the timestamp into "seconds"
+events1$timestamp <- events1$timestamp..ns. / 1e9
+
+events1$timestamp_seconds <- events1$timestamp %% 10000
+
+# Create a new column 'event_time' that represents time since the last 'task.begin'
+events1 <- events1 %>%
+  group_by(name) %>%
+  arrange(name, timestamp_seconds) %>%
+  mutate(
+    event_time = timestamp_seconds - first(timestamp_seconds[event == 'task.begin'])
+  ) %>%
+  ungroup()
+
+# Replace the value for 'task.begin' with 0
+events1$event_time[events1$event == 'task.begin'] <- 0
+
+# Making a new nice df with the info I need
+events2 <- events1[, c("name", "event", "event_time")]
+
+```
+
+```{r}
+#Merging events2 and ETG_name
+events2 <- rename(events2, 'recording id' = "name")
+events2 <- merge(events2, ETG_name[, c("recording id", "wearer name")], by = "recording id", all.x = TRUE)
+events2 <- rename(events2, 'part_id' = "wearer name")
+
+# Making all part_id's to lowercased as I apparantly didn't do it before..
+events2$part_id <- tolower(events2$part_id)
+ETG_name$'wearer name' <- tolower(ETG_name$'wearer name')
+pc_name$'wearer name' <- tolower(pc_name$'wearer name')
+
+# MERGING
+fixations <- events2
+task <- rename(combined_df, part = part_id)
+fixations$part_id <- tolower(fixations$part_id)
+
+SART_events <- task %>% rowwise() %>% mutate(
+  event = first(subset(subset(fixations, part == part_id), (event_time >= elapsed_time_start) & (event_time < elapsed_time_end)))$event
+)
+
+SART_events <- rename(SART_events, 'part_id' = 'part')
+SART_events <- left_join(SART_events, events2 %>% select(part_id, event, event_time), by = c("part_id", "event"))
+
+```
+
+Fixing phone_name so it can be merged with events2 as well
+First, time needs to be elapsed
+```{r}
+# Making the timestamp columns from phone_name into "seconds"
+phone_name$start_time <- phone_name$'start timestamp [ns]' / 1e9
+phone_name$end_time <- phone_name$'end timestamp [ns]' / 1e9
+
+phone_name$start_time_s <- phone_name$start_time %% 10000
+phone_name$end_time_s <- phone_name$end_time %% 10000
+
+#Doing the same for events
+events$timestamp <- events$timestamp..ns. / 1e9
+
+#Making sure the participant ID is also in events and not only events 2
+events <- rename(events, 'recording id' = "recording.id")
+events <- merge(events, ETG_name[, c("recording id", "wearer name")], by = "recording id", all.x = TRUE)
+events <- rename(events, 'event' = "name")
+events <- rename(events, 'part_id' = "wearer name")
+
+#Now the events$timestamp and phone_name$start_time should be able to be merged
+phone_name <- rename(phone_name, 'part_id' = "wearer name")
+phone_name$part_id <- tolower(phone_name$part_id)
+phone_name1 <- phone_name[, c('recording id', 'part_id', 'fixation id', 'duration [ms]', 'fixation detected on surface', 'start_time', 'end_time')]
+
+# Hopefully merging events and phone_name1
+fixations1 <- rename(events, part = part_id)
+task1 <- rename(phone_name1, part = part_id)
+
+```
+
+```{r}
+task1 <- rename(task1, 'part_id' = 'part')
+fixations1 <- rename(fixations1, 'part_id' = 'part')
+
+task2 <- select(task1, part_id, start_time, `recording id`)
+fixations2 <- select(fixations1, part_id, timestamp, `recording id`)
+
+vec1 <- append(task2$start_time, fixations2$timestamp)
+df1 <- as.data.frame(vec1)
+
+df1 <- rename(df1, 'start_time' = 'vec1')
+df1 <- left_join(df1, task1 %>% select(part_id, start_time, `recording id`, end_time, `fixation id`, `duration [ms]`, `fixation detected on surface`), by = c("start_time"))
+df1 <- rename(df1, 'timestamp' = 'start_time')
+df1 <- left_join(df1, events %>% select(part_id, timestamp, event, type, `recording id`), by = c("part_id", "recording id", "timestamp"))
+
+# Create a subset of your data frame starting from the 552nd row
+df_subset <- df1 %>% slice(552:n())
+
+df_subset <- left_join(df_subset, events %>% select(part_id, timestamp, event, type, `recording id`), by = c("part_id", "timestamp", "event", "type", "recording id"))
+
+df_subset <- merge(df_subset, events, by = c("timestamp", "part_id", "event", "type", "recording id"), all.y = TRUE)
+
+df_subset1 <- df_subset %>% select(-timestamp..ns.)
+
+df_subset1 <- df_subset1 %>%
+  select(
+    timestamp,
+    part_id,
+    `recording id`,
+    end_time,
+    `fixation id`,
+    `duration [ms]`,
+    `fixation detected on surface`,
+    event,
+    type
+  )
+# Replace the original data frame with the result
+df1[552:nrow(df1), ] <- df_subset1
+
+# Merge columns and sort in ascending order
+df1 <- df1 %>% 
+  arrange(`recording id`, part_id, timestamp)
+
+# Only including everything between task.begin and task.end
+df1 <- df1 %>%
+  group_by(part_id) %>%
+  filter(event %in% c("task.begin", "task.end") | between(row_number(), which.max(event == "task.begin"), which.max(event == "task.end")))
+
+df1 <- left_join(df1, events2 %>% select(part_id, event, event_time), by = c("part_id", "event"))
+
+# Perform left join without duplicating rows in df1
+df1 <- df1 %>%
+  left_join(participant_summary %>% select(part_id, condition), by = "part_id")
+
+```
+
+
+The next steps were done IF the blinks and gaze were to be used for analysis. However, it wasn't - so the code is just here but not used to anything specifically. 
+```{r read_blinks}
+
+# create list of "blinks.csv" paths
+blinks <- lapply(subfolders, function(subfolder) {
+  # file path within each subfolder
+  blinks_path <- file.path(subfolder, "blinks.csv")
+
+  # Check if the file exists
+  if (file.exists(blinks_path)) {
+    # if the file exists, return the file path
+    return(blinks_path)
+  } else {
+    # if the file does not exist, return NULL
+    return(NULL)
+  }
+})
+
+# Remove NULL Values from the list 
+blinks <- Filter(Negate(is.null), blinks)
+
+# Read and Combine CSV files
+blinks <- bind_rows(lapply(blinks, read.csv))
+
+```
+
+```{r}
+blinks <- blinks %>% 
+  rename("blink_duration" = "duration..ms.") %>% 
+  mutate(blink_duration_s = blink_duration / 1000)
+  
+blinks <- blinks %>% 
+  rename("recording id" = "recording.id")
+
+blinks$blink_duration <- as.numeric(blinks$blink_duration)
+
+str(blinks)
+```
+
+```{r read_gaze}
+# create list of paths
+gaze <- lapply(subfolders, function(subfolder) {
+  # file path within each subfolder
+  gaze_path <- file.path(subfolder, "gaze.csv")
+
+  # Check if the file exists
+  if (file.exists(gaze_path)) {
+    # if the file exists, return the file path
+    return(gaze_path)
+  } else {
+    # if the file does not exist, return NULL
+    return(NULL)
+  }
+})
+
+# Remove NULL values from the list 
+gaze <- Filter(Negate(is.null), gaze)
+
+# Read and combine CSV files 
+gaze <- bind_rows(lapply(gaze, read.csv))
+
+# if we use the data maybe rename columns and so on
+
+```
+
+Visually exploring the data
+
+```{r}
+# Filter the DataFrame to include only task.end events
+task_end_df <- df1[df1$event == 'task.end', ]
+
+# Extract the 'event_time' column for analysis
+video_durations <- task_end_df$event_time
+
+# Calculate average, minimum, and maximum video durations
+average_duration <- mean(video_durations, na.rm = TRUE)
+min_duration <- min(video_durations, na.rm = TRUE)
+max_duration <- max(video_durations, na.rm = TRUE)
+sd_duration <- sd(video_durations, na.rm = TRUE)
+
+# Print the results
+cat("Average Video Duration:", round(average_duration, 2), "seconds\n")
+cat("Minimum Video Duration:", min_duration, "seconds\n")
+cat("Maximum Video Duration:", max_duration, "seconds\n")
+cat("Standard Deviation of Video Duration:", round(sd_duration, 2), "seconds\n")
+```
+
+```{r}
+# Summary of gender distribution in each group
+gender_summary <- SART_events %>%
+  distinct(part_id, .keep_all = TRUE) %>%  # Keep only unique participants
+  group_by(condition, part_gender) %>%
+  summarise(count = n()) %>%
+  pivot_wider(names_from = part_gender, values_from = count, values_fill = 0)
+
+# Summary of mean age and standard deviation in each group
+age_summary <- SART_events %>%
+  group_by(condition) %>%
+  summarise(mean_age = mean(part_age),
+            sd_age = sd(part_age))
+
+# Display the summaries
+print("Gender Distribution:")
+print(gender_summary)
+
+print("\nMean Age and Standard Deviation:")
+print(age_summary)
+
+# Histogram of age distribution
+ggplot(SART_events, aes(x = part_age)) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black") +
+  labs(title = "Distribution of Participant Age",
+       x = "Age",
+       y = "Count")
+
+# Bar plot of sex distribution
+ggplot(SART_events, aes(x = factor(part_gender), fill = factor(part_gender))) +
+  geom_bar() +
+  labs(title = "Distribution of Participant Gender",
+       x = "Gender",
+       y = "Count",
+       fill = "Gender")
+
+# Create a dataframe for usage distribution
+usage_df <- SART_events %>%
+  summarise(instagram = sum(instagram == "True") / n(),
+            messenger = sum(messenger == "True") / n(),
+            imessage = sum(imessage == "True") / n())
+
+# Bar plot of usage distribution
+usage_df_long <- tidyr::gather(usage_df, key = "platform", value = "percentage")
+
+ggplot(usage_df_long, aes(x = platform, y = percentage/88, fill = platform)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Distribution of Instagram, Messenger, and iMessage Usage",
+       x = "Platform",
+       y = "Participant count",
+       fill = "Platform")
+
+# Histogram of screentime distribution
+ggplot(SART_events, aes(x = decimal_hours)) +
+  geom_histogram(binwidth = 0.5, fill = "lightgreen", color = "black") +
+  labs(title = "Distribution of Screentime",
+       x = "Screentime",
+       y = "Count")
+
+# Bar plot of vision distribution
+ggplot(SART_events, aes(x = factor(part_normal_vision), fill = factor(part_normal_vision))) +
+  geom_bar() +
+  labs(title = "Distribution of Participant Vision",
+       x = "Vision",
+       y = "Count",
+       fill = "Vision")
+
+ggplot(SART_events, aes(x = factor(condition), y = resp_rt, fill = factor(condition))) +
+  geom_boxplot() +
+  labs(title = "Box plot of Response Time by Condition",
+       x = "Condition",
+       y = "Response Time",
+       fill = "Condition")
+
+# Calculate the proportion of correct responses by condition
+accuracy_by_condition <- SART_events %>%
+  group_by(condition) %>%
+  summarize(accuracy = sum(resp_acc) / n())
+
+# Bar plot of relative response accuracy by condition
+ggplot(accuracy_by_condition, aes(x = factor(condition), y = accuracy, fill = factor(condition))) +
+  geom_bar(stat = "identity") +
+  labs(title = "Relative Response Accuracy by Condition",
+       x = "Condition",
+       y = "Relative Accuracy",
+       fill = "Condition")
+
+# Count the number of blinks for each participant
+blink_counts <- blinks %>%
+  group_by('recording id') %>%
+  summarize(num_blinks = n())
+
+df2 <- df1 %>% 
+  select(condition, `fixation detected on surface`) %>%
+  drop_na()
+
+ggplot(df2, aes(x = factor(condition), fill = `fixation detected on surface`)) +
+  geom_bar(position = "dodge", color = "black", na.rm = TRUE) +  # Exclude NA values
+  labs(title = "Fixations detected on phone by Condition",
+       x = "Condition",
+       y = "Count",
+       fill = "Fixation on Surface") +
+  scale_fill_manual(values = c("TRUE" = "green", "FALSE" = "red"))  # Customize fill colors if needed
+
+# Assuming SART_events is your dataframe
+ggplot(SART_events, aes(x = resp_rt)) +
+  geom_histogram(binwidth = 0.1, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Histogram of Response Times",
+       x = "Response Time",
+       y = "Frequency") +
+  theme_minimal()
+
+# plotting a histogram for brathhold distribution
+ggplot(SART_events, aes(x = resp_rt)) +
+  geom_histogram(aes(y = ..density..)) +
+  ggtitle("Histogram of resp_rt densities") +
+  stat_function(fun = dnorm,
+                args = list(mean = mean(SART_events$resp_rt, na.rm = TRUE),
+                sd = sd(SART_events$resp_rt, na.rm = TRUE)),
+                colour= "blue", size = 1) +
+  theme_bw()
+
+```
+```{r}
+# Screen time info
+# Summary of mean screen time 
+screentime_summary <- SART_events %>%
+  group_by(part_id) %>% 
+  summarise(mean(screentime))
+#  summarise(mean_screentime = mean(screentime))
+
+mean(screentime_summary$`mean(screentime)`)
+print("\nAverage screentime for participants:")
+print(screentime_summary)
+
+60/100*0.483333
+```
+
+Now, Analysis!!!
+Starting with the hypothesis regarding fixations on the phone
+```{r}
+# Making a contingency table to check for assumptions - if one "cell" of the table < 5, it meets the assumptions for the Fisher's exact test
+contingency_table <- table(df1$condition, df1$'fixation detected on surface')
+contingency_table
+```
+```{r}
+# Making the Fisher's exact test
+fisher_result <- fisher.test(contingency_table)
+
+# Display the results
+print(fisher_result)
+```
+¨
+And now, the hypothesis inspecting how the reaction times are influenced by notifications: 
+
+```{r}
+
+#Factorizing the independent variable: condition (+screentime if it is to be used for analysis)
+SART_events$condition <- as.factor(SART_events$condition)
+SART_events$decimal_hours <- as.factor(SART_events$decimal_hours)
+
+```
+
+```{r}
+# Calculate the 5th percentile of the 'resp_rt' column
+threshold <- quantile(SART_events$resp_rt, 0.05, na.rm = TRUE)
+threshold
+
+# Create a new column 'fast_response' based on the threshold
+SART_events$fast_response <- ifelse(SART_events$resp_rt <= threshold, 1, 0)
+
+```
+
+```{r}
+#Trying the Stothart et al. method:
+# Fit the mixed-effects logistic regression model
+model1<- glmer(resp_acc ~ condition + (1 | part_id), 
+               family = binomial, 
+               data = SART_events,
+               control=glmerControl(optimizer="bobyqa"))
+
+# Display the model summary
+summary(model1)
+# summarize final model
+sjPlot::tab_model(model1)
+
+```
+
+```{r}
+# Testing for assumptions of linearity
+ggplot(data = SART_events, aes(x= condition, y = resid(model1))) +
+  geom_point() + 
+ # geom_smooth(method = "loess", se = FALSE) + 
+  geom_smooth(color = "red", method = "lm", linetype = 2, se = F) +
+  geom_smooth(se = F) +
+  labs(x= "Condition", y = "Residuals") + 
+  ggtitle("Residuals vs. condition")
+
+# Testing for outliers
+residuals <- residuals(model1, type = "response")
+# Q-Q plot
+qqnorm(residuals)
+qqline(residuals)
+
+# Plot residuals against fitted values
+plot(fitted(model1), residuals)
+
+```
+```{r}
+# Calculate the probability of commission error by condition
+commission_error_prob <- SART_events %>%
+  group_by(condition) %>%
+  summarize(commission_error = mean(resp_acc == 0))
+
+# Print the result
+print(commission_error_prob)
+
+# Plotting the probability of commission errors by condition with y-axis in %
+plot1 <- ggplot(commission_error_prob, aes(x = condition, y = probability * 100)) +
+  geom_bar(stat = "identity", fill = "lightblue", color = "black") +
+  labs(title = "Probability of Commission Errors by Condition",
+       x = "Condition",
+       y = "Probability (%)") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +  # Formats y-axis labels as percentages
+  theme_minimal()
+```
+
+
+```{r}
+# Fit mixed-effects logistic regression model with screentime
+model2 <- glmer(resp_acc ~ condition + screentime + (1 | part_id), 
+               data = SART_events,
+               family = binomial,
+               control=glmerControl(optimizer="bobyqa"))
+
+# Display the model summary
+summary(model2)
+sjPlot::tab_model(model2)
+```
+```{r}
+# Testing for assumptions of linearity
+ggplot(data = SART_events, aes(x= condition, y = resid(model2))) +
+  geom_point() + 
+ # geom_smooth(method = "loess", se = FALSE) + 
+  geom_smooth(color = "red", method = "lm", linetype = 2, se = F) +
+  geom_smooth(se = F) +
+  labs(x= "Condition", y = "Residuals") + 
+  ggtitle("Residuals vs. condition")
+
+# Testing the assumption of no multicollinearity
+vif(model2)
+
+# Testing for outliers
+residuals2 <- residuals(model2, type = "response")
+# Q-Q plot
+qqnorm(residuals2)
+qqline(residuals2)
+
+# Plot residuals against fitted values
+plot(fitted(model2), residuals2)
+
+```
+
+```{r}
+#Removing all NA's from fast_response
+SART_events2 <- SART_events[complete.cases(SART_events$fast_response), ]
+
+str(SART_events2)
+SART_events2$fast_response <- as.integer(SART_events2$fast_response)
+
+# Fit the mixed-effects logistic regression model for 'fast_response' as well. 
+model3<- glmer(fast_response ~ condition + (1 | part_id), 
+               family = binomial, 
+               data = SART_events2,
+               control=glmerControl(optimizer="bobyqa"))
+
+# Display the model summary
+summary(model3)
+sjPlot::tab_model(model3)
+
+```
+```{r}
+# Calculate the probability of commission error by condition
+fast_response_prob <- SART_events2 %>%
+  group_by(condition) %>%
+  summarize(fast_resp = mean(fast_response == 1))
+
+# Print the result
+print(fast_response_prob)
+
+# Plotting the probability of fast responses by condition with y-axis in %
+plot2 <- ggplot(fast_response_prob, aes(x = condition, y = probability1 * 100)) +
+  geom_bar(stat = "identity", fill = "orange", color = "black") +
+  labs(title = "Probability of making a fast response by Condition",
+       x = "Condition",
+       y = "Probability (%)") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +  # Formats y-axis labels as percentages
+  theme_minimal()
+```
+
+```{r}
+# Add a new column 'plot_type' to each data frame
+# commission_error_prob$plot_type <- "Commission Errors"
+# fast_response_prob$plot_type <- "Fast Responses"
+
+# Combine the two data frames
+combined_data1 <- left_join(commission_error_prob, fast_response_prob, by = "condition")
+
+str(combined_data1)
+
+# Melt the data frame to long format for easier plotting
+melted_data <- tidyr::pivot_longer(combined_data1, cols = c("commission_error", "fast_resp"), names_to = "variable", values_to = "probability")
+
+# Calculate standard errors
+standard_errors <- melted_data %>%
+  group_by(condition, variable) %>%
+  summarize(mean_prob = mean(probability),
+            se = sd(probability) / sqrt(n()))
+
+# Plotting using ggplot2
+ggplot(melted_data, aes(x = condition, y = probability * 100, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +
+  geom_errorbar(data = standard_errors, aes(x = condition, y = mean_prob * 100, 
+                                          ymin = (mean_prob - se) * 100, 
+                                          ymax = (mean_prob + se) * 100, 
+                                          group = variable),
+              position = position_dodge(width = 0.75), width = 0.25) +
+  labs(title = "Probability of making Commission Errors and Fast Responses by Condition",
+       x = "Condition",
+       y = "Probability (%)",
+       fill = "Variable") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+  scale_fill_manual(values = c("lightblue", "orange")) +  # Set custom fill colors
+  theme_minimal()
+
+
+
+
+# Plotting side by side using facet_wrap
+combined_plot <- ggplot(combined_data1, aes(x = condition, y = probability * 100, fill = plot_type)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +
+  labs(title = "Comparison of Commission Errors and Fast Responses by Condition",
+       x = "Condition",
+       y = "Probability (%)",
+       fill = "Plot Type") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+  theme_minimal() +
+  facet_wrap(~plot_type, scales = "free_y", ncol = 2)
+
+# Print the combined plot
+print(combined_plot)
+```
+
+```{r}
+# Testing for assumptions of linearity
+ggplot(data = SART_events2, aes(x= condition, y= resid(model3))) +
+  geom_point() + 
+  geom_smooth(color = "red", method = "lm", linetype = 2, se = F) +
+  geom_smooth(se = F) +
+  labs(x= "Condition", y = "Residuals") + 
+  ggtitle("Residuals vs. condition")
+
+# Testing for outliers
+residuals3 <- residuals(model3, type = "response")
+# Q-Q plot
+qqnorm(residuals3)
+qqline(residuals3)
+
+# Plot residuals against fitted values
+plot(fitted(model3), residuals3)
+
+```
+
+```{r}
+# Fit the mixed-effects logistic regression model for 'fast_response' as well. 
+model4<- glmer(fast_response ~ condition + screentime + (1 | part_id), 
+               family = binomial, 
+               data = SART_events2)
+
+# Display the model summary
+summary(model4)
+sjPlot::tab_model(model4)
+```
+```{r}
+# Testing for assumptions of linearity
+ggplot(data = SART_events2, aes(x= condition, y = resid(model4))) +
+  geom_point() + 
+ # geom_smooth(method = "loess", se = FALSE) + 
+  geom_smooth(color = "red", method = "lm", linetype = 2, se = F) +
+  geom_smooth(se = F) +
+  labs(x= "Condition", y = "Residuals") + 
+  ggtitle("Residuals vs. condition")
+
+# Testing the assumption of no multicollinearity
+vif(model4)
+
+# Testing for outliers
+residuals4 <- residuals(model4, type = "response")
+# Q-Q plot
+qqnorm(residuals4)
+qqline(residuals4)
+
+# Plot residuals against fitted values
+plot(fitted(model4), residuals4)
+```
+
+
